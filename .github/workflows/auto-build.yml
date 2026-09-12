@@ -1,0 +1,296 @@
+# .github/workflows/auto-build.yml
+#
+# Fully automatic: every day this checks SagerNet/sing-box for the latest STABLE
+# release. If this repository has no Release for that version yet, it builds
+# sing-box-for-android (other flavor, release build) from the matching upstream
+# tags, applies the Tasker patch, signs the APK with YOUR fixed key (from
+# secrets), and publishes a GitHub Release here. The patched app's built-in
+# updater then pulls that Release onto the phone (silent install via Shizuku).
+#
+# This repository holds only this workflow + apply-tasker-control-patch.sh.
+# Upstream source is checked out fresh on every run, so there is no fork to
+# sync and nothing to merge, ever.
+#
+# Secrets required (Settings -> Secrets and variables -> Actions):
+#   SFA_KEYSTORE_B64   base64 of signing-key/sfa.p12   (made by make-signing-key.sh)
+#   SFA_KEYSTORE_PASS  its password
+#
+# Manual run (Actions -> this workflow -> Run workflow): optionally give an
+# exact version (e.g. 1.14.0) and/or tick "force" to rebuild an existing one.
+
+name: Auto build (sing-box + Tasker patch)
+
+on:
+  schedule:
+    - cron: '37 19 * * *'          # daily 19:37 UTC = 03:37 Beijing time
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '构建指定的上游版本（例如 1.14.0）。留空 = 自动取上游最新稳定版'
+        required: false
+        default: ''
+      force:
+        description: '强制重新构建（即使这个版本的 Release 已经存在）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                  # create Releases + the keep-alive commit
+
+concurrency:
+  group: auto-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream for a new stable version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      tag: ${{ steps.pick.outputs.tag }}
+      sfa_ref: ${{ steps.pick.outputs.sfa_ref }}
+      prerelease: ${{ steps.pick.outputs.prerelease }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Pick the version to build
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            echo "Requested version: $VERSION"
+          else
+            # newest release that is neither a draft nor a prerelease (alpha/beta/rc)
+            VERSION="$(gh api 'repos/SagerNet/sing-box/releases?per_page=100' \
+                         --jq '[.[] | select((.draft or .prerelease) | not)][0].tag_name // empty')"
+            VERSION="${VERSION#v}"
+            [ -n "$VERSION" ] || { echo "::error::could not find a stable release of SagerNet/sing-box"; exit 1; }
+            echo "Latest upstream stable: $VERSION"
+          fi
+          TAG="v${VERSION}"
+          case "$VERSION" in
+            *-alpha*|*-beta*|*-rc*) PRE=true ;;
+            *)                      PRE=false ;;
+          esac
+
+          # Find the matching app source: the same tag if the app repo has it, otherwise a
+          # branch whose version.properties carries exactly this VERSION_NAME (pinned to its SHA).
+          APP=repos/SagerNet/sing-box-for-android
+          SFA_REF=""
+          if gh api "$APP/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            SFA_REF="$TAG"
+            echo "App source: tag $TAG"
+          else
+            for BR in stable main; do
+              NAME="$(gh api "$APP/contents/version.properties?ref=$BR" --jq '.content' 2>/dev/null \
+                        | base64 -d | grep '^VERSION_NAME=' | cut -d= -f2- | tr -d '[:space:]' || true)"
+              if [ "$NAME" = "$VERSION" ]; then
+                SFA_REF="$(gh api "$APP/commits/$BR" --jq '.sha')"
+                echo "App source: no tag $TAG; branch '$BR' @ $SFA_REF has VERSION_NAME=$NAME"
+                break
+              fi
+            done
+          fi
+          if [ -z "$SFA_REF" ]; then
+            echo "::error::sing-box-for-android has neither a tag ${TAG} nor a stable/main branch at version ${VERSION} (yet?). Try again later, or pass a version manually."
+            exit 1
+          fi
+
+          if [ "${INPUT_FORCE:-false}" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            BUILD=false
+            echo "Release $TAG already exists in $GITHUB_REPOSITORY - nothing to do."
+            echo "### 已是最新：$TAG 已经构建过，本次无事可做" >> "$GITHUB_STEP_SUMMARY"
+          else
+            BUILD=true
+            echo "### 将构建 $TAG" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "sfa_ref=$SFA_REF"
+            echo "prerelease=$PRE"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Keep the schedule alive
+        # GitHub switches off cron-triggered workflows in a public repository after
+        # 60 days without any commit. An empty commit every ~45 days prevents that.
+        if: always()
+        run: |
+          set -euo pipefail
+          last="$(git log -1 --format=%ct)"
+          age_days=$(( ( $(date +%s) - last ) / 86400 ))
+          echo "Last commit is ${age_days} day(s) old."
+          if [ "$age_days" -ge 45 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep the scheduled workflow alive"
+            git push
+            echo "Pushed a keep-alive commit."
+          fi
+
+  build:
+    name: Build ${{ needs.check.outputs.tag }} and publish
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      PRERELEASE: ${{ needs.check.outputs.prerelease }}
+    steps:
+      - name: Checkout this repository (patch script)
+        uses: actions/checkout@v4
+        with:
+          path: tools
+
+      - name: Checkout sing-box-for-android @ ${{ needs.check.outputs.sfa_ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box-for-android
+          ref: ${{ needs.check.outputs.sfa_ref }}
+          path: sing-box-for-android
+          submodules: recursive
+
+      - name: Checkout sing-box core @ ${{ needs.check.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ needs.check.outputs.tag }}
+          path: sing-box
+          fetch-depth: 0               # build_libbox reads the version via `git describe --tags`
+
+      - name: Read version.properties
+        id: ver
+        run: |
+          set -euo pipefail
+          cd sing-box-for-android
+          NAME="$(grep '^VERSION_NAME=' version.properties | cut -d= -f2- | tr -d '[:space:]')"
+          CODE="$(grep '^VERSION_CODE=' version.properties | cut -d= -f2- | tr -d '[:space:]')"
+          GO="$(grep '^GO_VERSION='   version.properties | cut -d= -f2- | tr -d '[:space:]' | sed 's/^go//')"
+          if [ -z "$NAME" ] || [ -z "$CODE" ] || [ -z "$GO" ]; then
+            echo "::error::could not read VERSION_NAME / VERSION_CODE / GO_VERSION from version.properties"; exit 1
+          fi
+          if [ "$NAME" != "$VERSION" ]; then
+            echo "::error::tag is $TAG but version.properties says VERSION_NAME=$NAME - refusing to build a mismatched APK"; exit 1
+          fi
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "go=$GO"     >> "$GITHUB_OUTPUT"
+          echo "VERSION_NAME=$NAME  VERSION_CODE=$CODE  Go=$GO"
+
+      - name: Setup Go ${{ steps.ver.outputs.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.ver.outputs.go }}
+          cache: false
+
+      - name: Put GOPATH/bin on PATH (gomobile / gobind)
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android NDK r28
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      - name: Export ANDROID_NDK_HOME for every later step (gomobile and Gradle both read it)
+        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: Install the signing key from secrets
+        env:
+          SFA_KEYSTORE_B64: ${{ secrets.SFA_KEYSTORE_B64 }}
+          SFA_KEYSTORE_PASS: ${{ secrets.SFA_KEYSTORE_PASS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SFA_KEYSTORE_B64" ] || [ -z "$SFA_KEYSTORE_PASS" ]; then
+            echo "::error::secrets SFA_KEYSTORE_B64 and SFA_KEYSTORE_PASS must both be set (tutorial, step 4)"; exit 1
+          fi
+          KS=sing-box-for-android/app/release.keystore
+          printf '%s' "$SFA_KEYSTORE_B64" | tr -d ' \n\r' | base64 -d > "$KS"
+          # fail fast (before the 20-minute build) if the key or its password is wrong
+          keytool -list -keystore "$KS" -storepass "$SFA_KEYSTORE_PASS" -alias sfa >/dev/null
+          # app/build.gradle.kts reads these from the LOCAL_PROPERTIES env var (base64 of a .properties file)
+          LP="$(printf 'KEYSTORE_PASS=%s\nALIAS_NAME=sfa\nALIAS_PASS=%s\n' "$SFA_KEYSTORE_PASS" "$SFA_KEYSTORE_PASS" | base64 -w0)"
+          echo "::add-mask::$LP"
+          echo "LOCAL_PROPERTIES=$LP" >> "$GITHUB_ENV"
+          echo "Signing key OK."
+
+      - name: Build libbox.aar from the core (gomobile)
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          mkdir -p ../sing-box-for-android/app/libs
+          make lib_install                 # installs sagernet/gomobile + gobind
+          make lib_android                 # builds libbox.aar (+ libbox-legacy.aar)
+          cp -f ./*.aar ../sing-box-for-android/app/libs/
+          ls -l ../sing-box-for-android/app/libs
+
+      - name: Apply the Tasker patch (build-time only, never committed)
+        run: bash tools/apply-tasker-control-patch.sh --repo-root sing-box-for-android --update-repo "$GITHUB_REPOSITORY"
+
+      - name: Build the APK (other flavor, release)
+        working-directory: sing-box-for-android
+        run: ./gradlew --no-daemon assembleOtherRelease
+
+      - name: Collect the APK + version metadata
+        id: out
+        env:
+          CODE: ${{ steps.ver.outputs.code }}
+        run: |
+          set -euo pipefail
+          OUT=sing-box-for-android/app/build/outputs/apk/other/release
+          ls -l "$OUT"
+          APK="$OUT/SFA-${VERSION}-arm64-v8a.apk"
+          [ -f "$APK" ] || { echo "::error::expected $APK not found"; exit 1; }
+          # the in-app updater reads this file from the Release to learn the version
+          printf '{"version_code":%s,"version_name":"%s"}\n' "$CODE" "$VERSION" > SFA-version-metadata.json
+          cat SFA-version-metadata.json
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release ${{ needs.check.outputs.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APK: ${{ steps.out.outputs.apk }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Automated build of upstream **sing-box-for-android ${TAG}** (\`other\` flavor, release build) with the Tasker ControlReceiver patch; the in-app updater points at this repository.
+
+          - Upstream release: https://github.com/SagerNet/sing-box/releases/tag/${TAG}
+          - Patch applied at build time: \`apply-tasker-control-patch.sh\` in this repository
+          - Signed with this repository's own key: installs in place over earlier builds from here (NOT over the official APK - uninstall that first, once)
+          EOF
+          PRE_FLAG=""
+          if [ "$PRERELEASE" = "true" ]; then PRE_FLAG="--prerelease"; fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists - replacing its assets."
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$APK" SFA-version-metadata.json
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "SFA ${VERSION} (Tasker build)" --notes-file notes.md $PRE_FLAG \
+              "$APK" SFA-version-metadata.json
+          fi
+          echo "### 已发布 $TAG → https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload every ABI variant as a workflow artifact (backup, kept 14 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFA-${{ needs.check.outputs.version }}-all-abis
+          path: sing-box-for-android/app/build/outputs/apk/other/release/*.apk
+          retention-days: 14
+          if-no-files-found: error
