@@ -63,12 +63,27 @@ jobs:
           INPUT_FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
+          # gh api with retries: api.github.com occasionally drops HTTP/2 streams
+          # ("stream error ... CANCEL"). A real 404 is returned at once, not retried.
+          GH_ERR="$(mktemp)"
+          gh_api() {
+            local i
+            for i in 1 2 3 4 5; do
+              if gh api "$@" 2>"$GH_ERR"; then return 0; fi
+              if grep -q 'HTTP 404' "$GH_ERR"; then return 1; fi
+              echo "gh api $1 failed (attempt $i/5): $(head -c 200 "$GH_ERR") - retrying in $((i*5))s" >&2
+              sleep $((i*5))
+            done
+            cat "$GH_ERR" >&2
+            return 1
+          }
+
           if [ -n "${INPUT_VERSION:-}" ]; then
             VERSION="${INPUT_VERSION#v}"
             echo "Requested version: $VERSION"
           else
             # newest release that is neither a draft nor a prerelease (alpha/beta/rc)
-            VERSION="$(gh api 'repos/SagerNet/sing-box/releases?per_page=100' \
+            VERSION="$(gh_api 'repos/SagerNet/sing-box/releases?per_page=100' \
                          --jq '[.[] | select((.draft or .prerelease) | not)][0].tag_name // empty')"
             VERSION="${VERSION#v}"
             [ -n "$VERSION" ] || { echo "::error::could not find a stable release of SagerNet/sing-box"; exit 1; }
@@ -84,15 +99,15 @@ jobs:
           # branch whose version.properties carries exactly this VERSION_NAME (pinned to its SHA).
           APP=repos/SagerNet/sing-box-for-android
           SFA_REF=""
-          if gh api "$APP/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+          if gh_api "$APP/git/ref/tags/${TAG}" >/dev/null 2>&1; then
             SFA_REF="$TAG"
             echo "App source: tag $TAG"
           else
             for BR in stable main; do
-              NAME="$(gh api "$APP/contents/version.properties?ref=$BR" --jq '.content' 2>/dev/null \
+              NAME="$(gh_api "$APP/contents/version.properties?ref=$BR" --jq '.content' 2>/dev/null \
                         | base64 -d | grep '^VERSION_NAME=' | cut -d= -f2- | tr -d '[:space:]' || true)"
               if [ "$NAME" = "$VERSION" ]; then
-                SFA_REF="$(gh api "$APP/commits/$BR" --jq '.sha')"
+                SFA_REF="$(gh_api "$APP/commits/$BR" --jq '.sha')"
                 echo "App source: no tag $TAG; branch '$BR' @ $SFA_REF has VERSION_NAME=$NAME"
                 break
               fi
