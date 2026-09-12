@@ -186,7 +186,9 @@ EOF
         echo '[+] BoxService.kt: SERVICE_STARTED / SERVICE_STOPPED broadcasts + stopForUpdate()'
     fi
 
-    # 3d) ApkInstaller.kt (other / otherLegacy): the pre-install stop is a stop "for update"
+    # 3d) ApkInstaller.kt: the pre-install stop is a stop "for update". The otherLegacy flavor's
+    #     installer has no pre-install stop at all (checked at 1.14.0), so "nothing to do" is fine
+    #     there; the `other` flavor -- the one we ship -- must end up patched.
     for f in "${INSTALLER_FILES[@]}"; do
         [ -f "$f" ] || continue
         FLAVOR="$(echo "$f" | sed -E 's#.*/app/src/([^/]+)/.*#\1#')"
@@ -196,9 +198,11 @@ EOF
             perl -i -pe 's/BoxService\.stop\(\)/BoxService.stopForUpdate()/g' "$f"
             echo "[+] ApkInstaller.kt ($FLAVOR): pre-install stop -> stopForUpdate()"
         else
-            die "Anchor 'BoxService.stop()' not found in $f."
+            echo "[=] ApkInstaller.kt ($FLAVOR) has no pre-install BoxService.stop(), nothing to do"
         fi
     done
+    grep -q 'BoxService.stopForUpdate()' "${INSTALLER_FILES[0]}" \
+        || die "ApkInstaller.kt (other) does not call BoxService.stopForUpdate() - anchor 'BoxService.stop()' missing (upstream changed?)."
 
     # 4) GitHubUpdateChecker.kt: point the built-in updater at OWNER/REPO (only if asked)
     if [ -n "$UPDATE_REPO" ]; then
