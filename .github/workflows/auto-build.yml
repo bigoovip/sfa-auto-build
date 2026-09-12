@@ -303,7 +303,7 @@ jobs:
           echo "### 已发布 $TAG → https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload every ABI variant as a workflow artifact (backup, kept 14 days)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: SFA-${{ needs.check.outputs.version }}-all-abis
           path: sing-box-for-android/app/build/outputs/apk/other/release/*.apk
