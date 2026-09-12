@@ -53,7 +53,7 @@ jobs:
       build: ${{ steps.pick.outputs.build }}
     steps:
       - name: Checkout this repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Pick the version to build
         id: pick
@@ -149,12 +149,12 @@ jobs:
       PRERELEASE: ${{ needs.check.outputs.prerelease }}
     steps:
       - name: Checkout this repository (patch script)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: tools
 
       - name: Checkout sing-box-for-android @ ${{ needs.check.outputs.sfa_ref }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: SagerNet/sing-box-for-android
           ref: ${{ needs.check.outputs.sfa_ref }}
@@ -162,7 +162,7 @@ jobs:
           submodules: recursive
 
       - name: Checkout sing-box core @ ${{ needs.check.outputs.tag }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: SagerNet/sing-box
           ref: ${{ needs.check.outputs.tag }}
@@ -188,7 +188,7 @@ jobs:
           echo "VERSION_NAME=$NAME  VERSION_CODE=$CODE  Go=$GO"
 
       - name: Setup Go ${{ steps.ver.outputs.go }}
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.ver.outputs.go }}
           cache: false
@@ -197,7 +197,7 @@ jobs:
         run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Setup JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5         # build_libbox hard-requires JDK 17
         with:
           distribution: temurin
           java-version: '17'
