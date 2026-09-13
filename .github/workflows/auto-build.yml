@@ -64,12 +64,16 @@ jobs:
         run: |
           set -euo pipefail
           # gh api with retries: api.github.com occasionally drops HTTP/2 streams
-          # ("stream error ... CANCEL"). A real 404 is returned at once, not retried.
+          # ("stream error ... CANCEL") or answers 5xx. A real 404 is returned at once,
+          # not retried. NOTE: on an HTTP error gh prints the response BODY to stdout,
+          # so stdout is buffered per attempt and only emitted for the successful one -
+          # otherwise a failed attempt's error JSON would leak into the captured value.
           GH_ERR="$(mktemp)"
+          GH_OUT="$(mktemp)"
           gh_api() {
             local i
             for i in 1 2 3 4 5; do
-              if gh api "$@" 2>"$GH_ERR"; then return 0; fi
+              if gh api "$@" >"$GH_OUT" 2>"$GH_ERR"; then cat "$GH_OUT"; return 0; fi
               if grep -q 'HTTP 404' "$GH_ERR"; then return 1; fi
               echo "gh api $1 failed (attempt $i/5): $(head -c 200 "$GH_ERR") - retrying in $((i*5))s" >&2
               sleep $((i*5))
