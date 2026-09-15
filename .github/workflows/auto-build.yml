@@ -17,6 +17,14 @@
 #
 # Manual run (Actions -> this workflow -> Run workflow): optionally give an
 # exact version (e.g. 1.14.0) and/or tick "force" to rebuild an existing one.
+#
+# The app repository (sing-box-for-android) has no version tags and upstream
+# bumps its version.properties hours BEFORE publishing the matching core release.
+# So the check job first asks "is this version already published here?" (then it
+# simply stops), and only then looks for the app source: branch head at that
+# version, or the commit in the branch history that set it. If the app source is
+# not there yet for a fresh core release, the run ends with a warning (not a
+# failure) and tries again the next day.
 
 name: Auto build (sing-box + Tasker patch)
 
@@ -82,14 +90,36 @@ jobs:
             return 1
           }
 
+          CORE=repos/SagerNet/sing-box
+          APP=repos/SagerNet/sing-box-for-android
+          # VERSION_NAME from the app's version.properties at a tag / branch / commit ("" if absent)
+          version_name_at() {
+            gh_api "$APP/contents/version.properties?ref=$1" --jq '.content' \
+              | base64 -d | grep '^VERSION_NAME=' | cut -d= -f2- | tr -d '[:space:]' || true
+          }
+          finish() {   # $1 = true|false: write the job outputs and end this step successfully
+            {
+              echo "version=$VERSION"
+              echo "tag=$TAG"
+              echo "sfa_ref=${SFA_REF:-}"
+              echo "prerelease=$PRE"
+              echo "build=$1"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # ---- 1. which version ---------------------------------------------------------
           if [ -n "${INPUT_VERSION:-}" ]; then
             VERSION="${INPUT_VERSION#v}"
             echo "Requested version: $VERSION"
           else
-            # newest release that is neither a draft nor a prerelease (alpha/beta/rc)
-            VERSION="$(gh_api 'repos/SagerNet/sing-box/releases?per_page=100' \
-                         --jq '[.[] | select((.draft or .prerelease) | not)][0].tag_name // empty')"
-            VERSION="${VERSION#v}"
+            # highest stable version (not draft, not alpha/beta/rc). Highest by version
+            # number rather than newest by date: upstream can still publish a 1.13.x
+            # hotfix after 1.14.0 is out, and that must not be picked over 1.14.x.
+            VERSION="$(gh_api "$CORE/releases?per_page=100" \
+                         --jq '[.[] | select((.draft or .prerelease) | not) | .tag_name | ltrimstr("v")
+                                | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))]
+                               | sort_by(split(".") | map(tonumber)) | last // empty')"
             [ -n "$VERSION" ] || { echo "::error::could not find a stable release of SagerNet/sing-box"; exit 1; }
             echo "Latest upstream stable: $VERSION"
           fi
@@ -98,46 +128,70 @@ jobs:
             *-alpha*|*-beta*|*-rc*) PRE=true ;;
             *)                      PRE=false ;;
           esac
+          # The core release must exist (catches a mistyped manual version early). Its age
+          # decides below whether "app source not there yet" is a warning or an error.
+          PUBLISHED="$(gh_api "$CORE/releases/tags/$TAG" --jq '.published_at // empty' || true)"
+          if [ -z "$PUBLISHED" ]; then
+            echo "::error::SagerNet/sing-box has no release ${TAG} - check the version (e.g. 1.14.1, without the v)"; exit 1
+          fi
+          AGE_DAYS=$(( ( $(date +%s) - $(date -d "$PUBLISHED" +%s) ) / 86400 ))
+          echo "Core release $TAG was published $PUBLISHED (${AGE_DAYS} day(s) ago)."
 
-          # Find the matching app source: the same tag if the app repo has it, otherwise a
-          # branch whose version.properties carries exactly this VERSION_NAME (pinned to its SHA).
-          APP=repos/SagerNet/sing-box-for-android
-          SFA_REF=""
-          if gh_api "$APP/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            SFA_REF="$TAG"
-            echo "App source: tag $TAG"
-          else
-            for BR in stable main; do
-              NAME="$(gh_api "$APP/contents/version.properties?ref=$BR" --jq '.content' 2>/dev/null \
-                        | base64 -d | grep '^VERSION_NAME=' | cut -d= -f2- | tr -d '[:space:]' || true)"
-              if [ "$NAME" = "$VERSION" ]; then
-                SFA_REF="$(gh_api "$APP/commits/$BR" --jq '.sha')"
-                echo "App source: no tag $TAG; branch '$BR' @ $SFA_REF has VERSION_NAME=$NAME"
+          # ---- 2. already built? then stop here -----------------------------------------
+          # This check comes BEFORE looking for the app source on purpose: upstream bumps
+          # the app's version.properties to the NEXT version hours before publishing that
+          # core release, and during that window the app repository has no ref at the
+          # current stable version at all - which must not become a failed run when there
+          # is nothing to build anyway.
+          if [ "${INPUT_FORCE:-false}" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists in $GITHUB_REPOSITORY - nothing to do."
+            echo "### 已是最新：$TAG 已经构建过，本次无事可做" >> "$GITHUB_STEP_SUMMARY"
+            finish false
+          fi
+
+          # ---- 3. matching app source ---------------------------------------------------
+          # The app repository has no version tags, so look, in this order, for:
+          #   a) a tag v<VERSION> anyway (free to check, in case upstream starts tagging)
+          #   b) a branch whose version.properties is at exactly VERSION, pinned to its SHA
+          #      (main = stable line, dev = alpha/beta/rc, stable = the previous stable line)
+          #   c) the newest commit in those branches' history that set VERSION_NAME=VERSION
+          #      ("Bump version X") - for when the branch has already moved on to the next one
+          SFA_REF=""; HOW=""
+          if gh_api "$APP/git/ref/tags/${TAG}" >/dev/null; then
+            SFA_REF="$TAG"; HOW="tag $TAG"
+          fi
+          if [ -z "$SFA_REF" ]; then
+            for BR in main dev stable; do
+              if [ "$(version_name_at "$BR")" = "$VERSION" ]; then
+                SFA_REF="$(gh_api "$APP/commits/$BR" --jq '.sha')"; HOW="branch $BR @ $SFA_REF"
                 break
               fi
             done
           fi
           if [ -z "$SFA_REF" ]; then
-            echo "::error::sing-box-for-android has neither a tag ${TAG} nor a stable/main branch at version ${VERSION} (yet?). Try again later, or pass a version manually."
+            for BR in main dev stable; do
+              for SHA in $(gh_api "$APP/commits?sha=$BR&path=version.properties&per_page=60" --jq '.[].sha' || true); do
+                if [ "$(version_name_at "$SHA")" = "$VERSION" ]; then
+                  SFA_REF="$SHA"; HOW="commit $SHA (the one that set VERSION_NAME=$VERSION on branch $BR, which has since moved on)"
+                  break 2
+                fi
+              done
+            done
+          fi
+          if [ -z "$SFA_REF" ]; then
+            MSG="sing-box-for-android has no source at version ${VERSION}: no tag ${TAG}, and neither main/dev/stable nor their recent history has version.properties at VERSION_NAME=${VERSION}."
+            if [ -z "${INPUT_VERSION:-}" ] && [ "$AGE_DAYS" -le 3 ]; then
+              # fresh core release; upstream normally updates the app within hours - retry tomorrow
+              echo "::warning::$MSG The core release is only ${AGE_DAYS} day(s) old - will try again on the next run."
+              echo "### 等待上游：内核 $TAG 已发布，但 App 源码还没到这个版本，明天自动重试" >> "$GITHUB_STEP_SUMMARY"
+              finish false
+            fi
+            echo "::error::$MSG The core release is already ${AGE_DAYS} day(s) old, so something changed upstream - see https://github.com/SagerNet/sing-box-for-android/commits/main"
             exit 1
           fi
-
-          if [ "${INPUT_FORCE:-false}" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            BUILD=false
-            echo "Release $TAG already exists in $GITHUB_REPOSITORY - nothing to do."
-            echo "### 已是最新：$TAG 已经构建过，本次无事可做" >> "$GITHUB_STEP_SUMMARY"
-          else
-            BUILD=true
-            echo "### 将构建 $TAG" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          {
-            echo "version=$VERSION"
-            echo "tag=$TAG"
-            echo "sfa_ref=$SFA_REF"
-            echo "prerelease=$PRE"
-            echo "build=$BUILD"
-          } >> "$GITHUB_OUTPUT"
+          echo "App source: $HOW"
+          echo "### 将构建 $TAG（App 源码：$HOW）" >> "$GITHUB_STEP_SUMMARY"
+          finish true
 
       - name: Keep the schedule alive
         # GitHub switches off cron-triggered workflows in a public repository after
