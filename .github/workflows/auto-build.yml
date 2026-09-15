@@ -95,7 +95,7 @@ jobs:
           # VERSION_NAME from the app's version.properties at a tag / branch / commit ("" if absent)
           version_name_at() {
             gh_api "$APP/contents/version.properties?ref=$1" --jq '.content' \
-              | base64 -d | grep '^VERSION_NAME=' | cut -d= -f2- | tr -d '[:space:]' || true
+              | tr -d '\r\n' | base64 -d | grep '^VERSION_NAME=' | cut -d= -f2- | tr -d '[:space:]' || true
           }
           finish() {   # $1 = true|false: write the job outputs and end this step successfully
             {
