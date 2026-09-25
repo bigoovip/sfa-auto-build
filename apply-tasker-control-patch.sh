@@ -176,11 +176,13 @@ EOF
         grep -qF "$BC_STOPPED_USER" "$BOX_FILE" || die "Anchor 'status.value = Status.Stopping' not found in BoxService.kt."
 
         # (iv) in stopService(): keep startedByUser when stopping for an update, then clear the flag
-        perl -0777 -i -pe 's/^([ \t]+)Settings\.startedByUser = false\n(?=[ \t]+withContext\(Dispatchers\.Main\) \{\n[ \t]+status\.value = Status\.Stopped\n)/${1}if (!stoppingForUpdate) Settings.startedByUser = false\n${1}stoppingForUpdate = false\n/m' "$BOX_FILE"
+        # The lookahead tolerates upstream 1.14.2's extra `Settings.dataStore.flush()` line
+        # between the flag and the status update (newer versions may drop it again).
+        perl -0777 -i -pe 's/^([ \t]+)Settings\.startedByUser = false\n(?=(?:[ \t]+Settings\.dataStore\.flush\(\)\n)?[ \t]+withContext\(Dispatchers\.Main\) \{\n[ \t]+status\.value = Status\.Stopped\n)/${1}if (!stoppingForUpdate) Settings.startedByUser = false\n${1}stoppingForUpdate = false\n/m' "$BOX_FILE"
         grep -q 'if (!stoppingForUpdate) Settings.startedByUser = false' "$BOX_FILE" || die "Anchor 'Settings.startedByUser = false' (in stopService) not found in BoxService.kt."
 
         # (v) stop because of an error (bad config, missing permission...) -> SERVICE_STOPPED reason=error
-        BC="$BC_STOPPED_ERR" perl -0777 -i -pe 's/^([ \t]+)Settings\.startedByUser = false\n(?=[ \t]+val pfd = fileDescriptor\n)/${1}Settings.startedByUser = false\n${1}$ENV{BC}\n/m' "$BOX_FILE"
+        BC="$BC_STOPPED_ERR" perl -0777 -i -pe 's/^([ \t]+)Settings\.startedByUser = false\n(?=(?:[ \t]+Settings\.dataStore\.flush\(\)\n)?[ \t]+val pfd = fileDescriptor\n)/${1}Settings.startedByUser = false\n${1}$ENV{BC}\n/m' "$BOX_FILE"
         grep -qF "$BC_STOPPED_ERR" "$BOX_FILE" || die "Anchor 'Settings.startedByUser = false' (in stopAndAlert) not found in BoxService.kt."
 
         echo '[+] BoxService.kt: SERVICE_STARTED / SERVICE_STOPPED broadcasts + stopForUpdate()'
